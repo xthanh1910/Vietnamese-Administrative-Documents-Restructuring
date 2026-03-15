@@ -1,4 +1,4 @@
-# Vietnamese-Legal-Text-Restructuring
+# Vietnamese Administrative Documents Restructuring
 
 This project automates the reconstruction of Vietnamese legal and administrative documents from images/scans into fully formatted Microsoft Word (.docx) files. By combining **PaddleOCR**, a fine-tuned **ViT5** language model, and intelligent layout analysis, the system ensures that the output text is both accurate and compliant with official government standards.
 

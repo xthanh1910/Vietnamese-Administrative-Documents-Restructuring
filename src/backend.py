@@ -40,7 +40,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 # PHẦN 1: KHỞI TẠO MODEL (CHỈ CHẠY 1 LẦN DUY NHẤT)
 # ==========================================================================
 
-MODEL_DIR = r"D:\2_BK\NAM_4\test-for-LVTN\my_model\checkpoint-34125"
+# MODEL_DIR = r"D:\2_BK\NAM_4\test-for-LVTN\my_model\checkpoint-34125"
+MODEL_DIR = r"/content/drive/MyDrive/Colab Notebooks/LVTN/my_model/checkpoint-34125"
 MODEL_PREFIX = "correction: "
 MAX_INPUT_LENGTH = 300
 

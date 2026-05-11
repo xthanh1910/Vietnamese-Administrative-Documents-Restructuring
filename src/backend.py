@@ -40,8 +40,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 # PHẦN 1: KHỞI TẠO MODEL (CHỈ CHẠY 1 LẦN DUY NHẤT)
 # ==========================================================================
 
-# MODEL_DIR = r"D:\2_BK\NAM_4\test-for-LVTN\my_model\checkpoint-34125"
-MODEL_DIR = r"/content/drive/MyDrive/Colab Notebooks/LVTN/my_model/checkpoint-34125"
+MODEL_DIR = r"D:\2_BK\NAM_4\test-for-LVTN\my_model\checkpoint-34125"
 MODEL_PREFIX = "correction: "
 MAX_INPUT_LENGTH = 300
 
@@ -89,12 +88,11 @@ PARAGRAPH_BREAK_KEYWORDS = re.compile(
     r"^\s*[\"""\'\'\']?\s*"
     r"(Điều\s*\d+[a-z]?\."
     r"|Chương\s+[IVXLCDM]+"
-    r"|Bổ sung\b"
-    r"|Sửa đổi\b"
-    r"|Căn cứ\b"
-    r"|Theo đề nghị\b"
-    r"|\d+[a-z]?\.)"
-    , re.IGNORECASE
+    r"|Bổ sung\b|Sửa đổi\b|Căn cứ\b|Theo đề nghị\b"
+    r"|\d+[a-zđ]?\."           # khoản 1. 2. 3.
+    r"|[a-zđ]\)"               # ← thêm đ vào đây
+    r")",
+    re.IGNORECASE
 )
 
 BOLD_KEYWORDS = re.compile(
@@ -140,10 +138,15 @@ def correct_text_ai(raw_text):
         MODEL_PREFIX + raw_text, return_tensors="pt",
         max_length=512, truncation=True
     ).to(device)
+
+    num_beams = get_num_beams(raw_text)          # ← thêm dòng này
+
     with torch.no_grad():
         outputs = nlp_model.generate(
-            inputs["input_ids"], max_length=512,
-            num_beams=5, early_stopping=True
+            inputs["input_ids"],
+            max_length=512,
+            num_beams=num_beams,                 # ← thay hardcode 5
+            early_stopping=(num_beams > 1),      # ← tắt khi greedy
         )
     corrected = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     if is_hallucinated(corrected):
@@ -188,16 +191,98 @@ def correct_chunk(raw_chunk):
         MODEL_PREFIX + raw_chunk, return_tensors="pt",
         max_length=512, truncation=True
     ).to(device)
+
+    num_beams = get_num_beams(raw_chunk)         # ← thêm dòng này
+
     with torch.no_grad():
         outputs = nlp_model.generate(
-            inputs["input_ids"], max_length=512,
-            num_beams=5, no_repeat_ngram_size=3, early_stopping=True
+            inputs["input_ids"],
+            max_length=512,
+            num_beams=num_beams,                 # ← thay hardcode 5
+            no_repeat_ngram_size=3,
+            early_stopping=(num_beams > 1),      # ← tắt khi greedy
         )
     corrected = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     if is_hallucinated(corrected):
         return raw_chunk
     return corrected
 
+# ==========================================================================
+# HÀM BATCH INFERENCE (MỚI)
+# Gom nhiều text → tokenize padding → 1 lần generate → decode từng output
+# ==========================================================================
+
+def correct_texts_batch(raw_texts: list[str], batch_size: int = 16) -> list[str]:
+    """
+    Thay thế việc gọi correct_text_ai() từng cái một.
+    
+    Args:
+        raw_texts: danh sách text thô (có thể rỗng)
+        batch_size: số sample mỗi lần forward (giảm nếu OOM)
+    Returns:
+        danh sách text đã sửa, cùng thứ tự với input
+    """
+    if not raw_texts:
+        return []
+
+    results = [""] * len(raw_texts)
+
+    # Tách index của các text không rỗng để xử lý
+    non_empty_indices = [i for i, t in enumerate(raw_texts) if t.strip()]
+    non_empty_texts   = [raw_texts[i] for i in non_empty_indices]
+
+    for batch_start in range(0, len(non_empty_texts), batch_size):
+        batch_texts = non_empty_texts[batch_start : batch_start + batch_size]
+        prefixed    = [MODEL_PREFIX + t for t in batch_texts]
+
+        # Tokenize với padding → tensor shape [B, seq_len]
+        inputs = tokenizer(
+            prefixed,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding=True,          # ← padding để stack thành batch
+        ).to(device)
+
+        # Tính num_beams cho cả batch (lấy max để đảm bảo chất lượng)
+        # Hoặc dùng greedy (num_beams=1) để tối đa tốc độ
+        max_len = max(len(t) for t in batch_texts)
+        num_beams = get_num_beams_batch(max_len)
+
+        with torch.no_grad():
+            outputs = nlp_model.generate(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_length=512,
+                num_beams=num_beams,
+                no_repeat_ngram_size=3 if num_beams > 1 else 0,
+                early_stopping=(num_beams > 1),
+            )
+
+        # Decode từng output trong batch
+        for local_idx, (out, raw) in enumerate(zip(outputs, batch_texts)):
+            corrected = tokenizer.decode(out, skip_special_tokens=True).strip()
+            if is_hallucinated(corrected):
+                corrected = raw
+            global_idx = non_empty_indices[batch_start + local_idx]
+            results[global_idx] = corrected
+
+    return results
+
+# new
+def get_num_beams_batch(max_text_len: int) -> int:
+    """
+    Phiên bản cho batch: dùng max độ dài trong batch để quyết định beam.
+    Ưu tiên greedy/beam nhỏ để batch nhanh hơn.
+    """
+    if max_text_len <= 10:
+        return 1
+    elif max_text_len <= 30:
+        return 2
+    elif max_text_len <= 80:
+        return 3
+    else:
+        return 5
 
 def fuzzy_match_dict(text, dictionary, threshold=0.85):
     """So khớp mờ text với dictionary.
@@ -264,24 +349,29 @@ def run_ocr_and_postprocess(img, progress_cb=None):
     if not raw_result:
         return [], 0, img_height, img_width
 
-    heights = [max(b[0][2][1], b[0][3][1]) - min(b[0][0][1], b[0][1][1]) for b in raw_result]
+    heights = [max(b[0][2][1], b[0][3][1]) - min(b[0][0][1], b[0][1][1])
+               for b in raw_result]
     avg_char_height = np.median(heights)
 
-    total_boxes = len(raw_result)
+    # ── [CŨ] Gọi AI từng box ──────────────────────────────────────────────
+    # for idx, box_data in enumerate(raw_result):
+    #     corrected = correct_text_ai(raw_text)  ← XÓA
+
+    # ── [MỚI] Thu thập raw_text toàn bộ → batch inference 1 lần ──────────
+    if progress_cb:
+        progress_cb(0, 1, f"Đang sửa lỗi AI batch {len(raw_result)} box...")
+
+    raw_texts = [box_data[1][0] for box_data in raw_result]
+    corrected_texts = correct_texts_batch(raw_texts)   # ← 1 LẦN DUY NHẤT
+
     boxes = []
-    for idx, box_data in enumerate(raw_result):
-        if progress_cb:
-            progress_cb(idx, total_boxes, f"Sửa lỗi AI box {idx+1}/{total_boxes}")
-
+    for idx, (box_data, corrected) in enumerate(zip(raw_result, corrected_texts)):
+        corrected = unicodedata.normalize('NFC', corrected)
         coords = box_data[0]
-        raw_text = box_data[1][0]
-        corrected = unicodedata.normalize('NFC', correct_text_ai(raw_text))
-
         x_min = min(pt[0] for pt in coords)
         x_max = max(pt[0] for pt in coords)
         y_min = min(pt[1] for pt in coords)
         y_max = max(pt[1] for pt in coords)
-
         boxes.append({
             'text': corrected, 'coords': coords,
             'x_min': x_min, 'x_max': x_max,
@@ -297,7 +387,7 @@ def run_ocr_and_postprocess(img, progress_cb=None):
                 box['text'] = matched
 
     if progress_cb:
-        progress_cb(total_boxes, total_boxes, "OCR + AI + Dictionary hoàn tất!")
+        progress_cb(1, 1, "OCR + AI batch + Dictionary hoàn tất!")
 
     return boxes, avg_char_height, img_height, img_width
 
@@ -781,7 +871,7 @@ def compute_normal_line_gap(line_stats):
     return np.median(gaps)
 
 
-def group_lines_into_paragraphs(line_stats, full_line_width, normal_gap):
+def group_lines_into_paragraphs(line_stats, full_line_width, normal_gap, global_x_min=0, avg_char_height=20):
     if not line_stats:
         return []
 
@@ -797,11 +887,15 @@ def group_lines_into_paragraphs(line_stats, full_line_width, normal_gap):
             should_cut = True
         elif normal_gap > 0:
             actual_gap = current_stat['y_min'] - prev_stat['y_max']
-            if actual_gap > normal_gap * 1.8:
+            if actual_gap > normal_gap * 2.0:
                 should_cut = True
 
-        if not should_cut and prev_stat['width'] < (full_line_width * 0.95):
-            should_cut = True
+        # MỚI — cắt khi prev ngắn HẲN *VÀ* curr có indent (= thực sự là đầu đoạn)
+        if not should_cut:
+            prev_short = prev_stat['width'] < (full_line_width * 0.75)
+            curr_indented = current_stat['x_min'] > global_x_min + avg_char_height * 0.6
+            if prev_short and curr_indented:
+                should_cut = True
 
         if should_cut:
             paragraphs.append(current_para)
@@ -827,26 +921,48 @@ def write_body_to_doc(doc, body_lines, avg_char_height, img_width,
 
     line_stats, full_line_width, global_x_min = compute_line_stats(body_lines, img_width)
     normal_gap = compute_normal_line_gap(line_stats)
+    paragraphs = group_lines_into_paragraphs(
+        line_stats, full_line_width, normal_gap, global_x_min, avg_char_height
+    )
 
-    paragraphs = group_lines_into_paragraphs(line_stats, full_line_width, normal_gap)
+    if not paragraphs:
+        return
 
-    total_paras = len(paragraphs)
-    for idx, para_stats in enumerate(paragraphs):
-        if progress_cb:
-            progress_cb(
-                progress_offset + idx, progress_total,
-                f"Sửa lỗi AI đoạn {idx+1}/{total_paras}"
-            )
+    # ── [MỚI] Chuẩn bị tất cả chunk TRƯỚC, batch 1 lần ──────────────────
+    # Bước 1: tạo danh sách (para_idx, chunk_idx, raw_chunk)
+    para_raw_texts   = []   # text thô mỗi para (chưa chunk nhỏ)
+    para_x_mins      = []
+    para_chunks_map  = []   # [(start_flat_idx, end_flat_idx), ...]
+    all_flat_chunks  = []   # tất cả chunk flatten
 
+    for para_stats in paragraphs:
         raw_text = " ".join([s['text'] for s in para_stats])
         para_x_min = para_stats[0]['x_min']
-
         chunks = chunk_paragraph(raw_text)
-        corrected_text = " ".join([correct_chunk(c) for c in chunks]).strip()
+        
+        start = len(all_flat_chunks)
+        all_flat_chunks.extend(chunks)
+        end = len(all_flat_chunks)
+        
+        para_raw_texts.append(raw_text)
+        para_x_mins.append(para_x_min)
+        para_chunks_map.append((start, end))
+
+    # Bước 2: batch inference toàn bộ chunks 1 lần
+    if progress_cb:
+        progress_cb(progress_offset, progress_total,
+                    f"Sửa lỗi AI batch {len(all_flat_chunks)} chunk body...")
+
+    corrected_flat = correct_texts_batch(all_flat_chunks)  # ← 1 LẦN DUY NHẤT
+
+    # Bước 3: ghép lại và xuất Word
+    for idx, (para_stats, para_x_min, (s, e)) in enumerate(
+        zip(paragraphs, para_x_mins, para_chunks_map)
+    ):
+        corrected_text = " ".join(corrected_flat[s:e]).strip()
 
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        # Body: line spacing 1.0, space_before=0, space_after=6pt
         p.paragraph_format.line_spacing = 1.0
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(6)
@@ -874,16 +990,46 @@ def write_body_to_doc(doc, body_lines, avg_char_height, img_width,
 # PHẦN 12: VẼ ẢNH DEBUG
 # ==========================================================================
 
+def _put_label_left(img, label, x1, y1, y2, color, font_scale=0.45, thickness=1):
+    """
+    Vẽ chữ label dọc theo cạnh TRÁI của bounding box (căn giữa theo chiều cao).
+    Chữ được đặt ngay bên ngoài (bên trái) của box, không đè lên nội dung.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+    box_h = y2 - y1
+    # Căn giữa label theo chiều dọc của box
+    ty = y1 + (box_h + th) // 2
+    # Đặt chữ bên trái box (lùi ra ngoài một chút)
+    tx = max(0, x1 - tw - 4)
+    cv2.putText(img, label, (tx, ty), font, font_scale, color, thickness, cv2.LINE_AA)
+
+
 def draw_debug_image(img, boxes, lines, title_line_idx,
                      ext_title_range, body_lines,
                      avg_char_height, img_width):
     debug_img = img.copy()
 
+    LABEL_FONT_SCALE = 0.45
+    LABEL_THICKNESS  = 1
+
+    # ------------------------------------------------------------------
+    # 1. Xác định các box thuộc TITLE, HEADER
+    # ------------------------------------------------------------------
     title_box_ids = set()
     if 0 <= title_line_idx < len(lines):
         for box in lines[title_line_idx]:
             title_box_ids.add(id(box))
 
+    header_box_ids = set()
+    if title_line_idx > 0:
+        for i in range(title_line_idx):
+            for box in lines[i]:
+                header_box_ids.add(id(box))
+
+    # ------------------------------------------------------------------
+    # 2. Vẽ từng OCR box (TITLE highlight đỏ)
+    # ------------------------------------------------------------------
     for box in boxes:
         coords = box['coords']
         pts = np.array(coords, dtype=np.int32)
@@ -892,18 +1038,44 @@ def draw_debug_image(img, boxes, lines, title_line_idx,
             overlay = debug_img.copy()
             cv2.fillPoly(overlay, [pts], (0, 0, 255))
             cv2.addWeighted(overlay, 0.15, debug_img, 0.85, 0, debug_img)
-            cv2.putText(debug_img, "TITLE",
-                        (int(box['x_min']), int(box['y_min']) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            _put_label_left(debug_img, "TITLE",
+                            int(box['x_min']), int(box['y_min']), int(box['y_max']),
+                            (0, 0, 255), LABEL_FONT_SCALE, LABEL_THICKNESS)
 
+    # ------------------------------------------------------------------
+    # 3. Vẽ bounding box HEADER (bao toàn bộ các dòng header)
+    # ------------------------------------------------------------------
+    if title_line_idx > 0:
+        header_all_boxes = [b for line in lines[:title_line_idx] for b in line]
+        if header_all_boxes:
+            hx1 = int(min(b['x_min'] for b in header_all_boxes)) - 5
+            hx2 = int(max(b['x_max'] for b in header_all_boxes)) + 5
+            hy1 = int(min(b['y_min'] for b in header_all_boxes)) - 5
+            hy2 = int(max(b['y_max'] for b in header_all_boxes)) + 5
+            HEADER_COLOR = (180, 105, 255)   # hồng tím
+            cv2.rectangle(debug_img, (hx1, hy1), (hx2, hy2), HEADER_COLOR, 2)
+            overlay = debug_img.copy()
+            cv2.rectangle(overlay, (hx1, hy1), (hx2, hy2), HEADER_COLOR, -1)
+            cv2.addWeighted(overlay, 0.08, debug_img, 0.92, 0, debug_img)
+            _put_label_left(debug_img, "HEADER",
+                            hx1, hy1, hy2,
+                            HEADER_COLOR, LABEL_FONT_SCALE, LABEL_THICKNESS)
+
+    # ------------------------------------------------------------------
+    # 4. Đường phân cách HEADER / BODY
+    # ------------------------------------------------------------------
     if 0 <= title_line_idx < len(lines):
         title_line = lines[title_line_idx]
         split_y = int(max(b['y_max'] for b in title_line))
         cv2.line(debug_img, (0, split_y), (debug_img.shape[1], split_y), (255, 0, 0), 2)
         cv2.putText(debug_img, "--- HEADER / BODY SPLIT ---",
-                    (10, split_y + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                    (10, split_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, (255, 0, 0),
+                    LABEL_THICKNESS, cv2.LINE_AA)
 
+    # ------------------------------------------------------------------
+    # 5. Vẽ bounding box EXT_TITLE
+    # ------------------------------------------------------------------
     ext_start, ext_end = ext_title_range
     if ext_start < ext_end and ext_start < len(lines):
         ext_boxes = []
@@ -914,14 +1086,18 @@ def draw_debug_image(img, boxes, lines, title_line_idx,
             ex2 = int(max(b['x_max'] for b in ext_boxes)) + 5
             ey1 = int(min(b['y_min'] for b in ext_boxes)) - 5
             ey2 = int(max(b['y_max'] for b in ext_boxes)) + 5
-            cv2.rectangle(debug_img, (ex1, ey1), (ex2, ey2), (0, 165, 255), 3)
+            EXT_COLOR = (0, 165, 255)
+            cv2.rectangle(debug_img, (ex1, ey1), (ex2, ey2), EXT_COLOR, 3)
             overlay = debug_img.copy()
-            cv2.rectangle(overlay, (ex1, ey1), (ex2, ey2), (0, 165, 255), -1)
+            cv2.rectangle(overlay, (ex1, ey1), (ex2, ey2), EXT_COLOR, -1)
             cv2.addWeighted(overlay, 0.12, debug_img, 0.88, 0, debug_img)
-            cv2.putText(debug_img, "EXT_TITLE",
-                        (ex1, ey1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            _put_label_left(debug_img, "EXT_TITLE",
+                            ex1, ey1, ey2,
+                            EXT_COLOR, LABEL_FONT_SCALE, LABEL_THICKNESS)
 
+    # ------------------------------------------------------------------
+    # 6. Vẽ bounding box các đoạn BODY (P1, P2, ...)
+    # ------------------------------------------------------------------
     if body_lines:
         line_stats, full_line_width, _ = compute_line_stats(body_lines, img_width)
         normal_gap = compute_normal_line_gap(line_stats)
@@ -949,9 +1125,9 @@ def draw_debug_image(img, boxes, lines, title_line_idx,
             overlay = debug_img.copy()
             cv2.rectangle(overlay, (px1, py1), (px2, py2), color, -1)
             cv2.addWeighted(overlay, 0.08, debug_img, 0.92, 0, debug_img)
-            cv2.putText(debug_img, f"P{para_idx+1}",
-                        (px1, py1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            _put_label_left(debug_img, f"P{para_idx+1}",
+                            px1, py1, py2,
+                            color, LABEL_FONT_SCALE, LABEL_THICKNESS)
 
     return debug_img
 

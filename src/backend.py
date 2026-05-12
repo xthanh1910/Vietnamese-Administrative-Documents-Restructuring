@@ -131,6 +131,17 @@ def is_hallucinated(text):
 # PHẦN 4: CÁC HÀM TIỆN ÍCH
 # ==========================================================================
 
+def get_num_beams(text: str) -> int:
+    n = len(text.strip())
+    if n <= 10:
+        return 1
+    elif n <= 30:
+        return 2
+    elif n <= 80:
+        return 3
+    else:
+        return 5
+
 def correct_text_ai(raw_text):
     if not raw_text.strip():
         return ""
@@ -212,77 +223,46 @@ def correct_chunk(raw_chunk):
 # Gom nhiều text → tokenize padding → 1 lần generate → decode từng output
 # ==========================================================================
 
-def correct_texts_batch(raw_texts: list[str], batch_size: int = 16) -> list[str]:
-    """
-    Thay thế việc gọi correct_text_ai() từng cái một.
-    
-    Args:
-        raw_texts: danh sách text thô (có thể rỗng)
-        batch_size: số sample mỗi lần forward (giảm nếu OOM)
-    Returns:
-        danh sách text đã sửa, cùng thứ tự với input
-    """
+def correct_texts_batch(raw_texts, batch_size=16):
     if not raw_texts:
         return []
 
     results = [""] * len(raw_texts)
+    non_empty = [(i, t) for i, t in enumerate(raw_texts) if t.strip()]
 
-    # Tách index của các text không rỗng để xử lý
-    non_empty_indices = [i for i, t in enumerate(raw_texts) if t.strip()]
-    non_empty_texts   = [raw_texts[i] for i in non_empty_indices]
+    # Nhóm theo num_beams → padding hiệu quả, không bị kéo lên
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for i, t in non_empty:
+        groups[get_num_beams(t)].append((i, t))
 
-    for batch_start in range(0, len(non_empty_texts), batch_size):
-        batch_texts = non_empty_texts[batch_start : batch_start + batch_size]
-        prefixed    = [MODEL_PREFIX + t for t in batch_texts]
+    for num_beams, items in groups.items():
+        for batch_start in range(0, len(items), batch_size):
+            batch_items = items[batch_start: batch_start + batch_size]
+            indices = [x[0] for x in batch_items]
+            texts   = [x[1] for x in batch_items]
+            prefixed = [MODEL_PREFIX + t for t in texts]
 
-        # Tokenize với padding → tensor shape [B, seq_len]
-        inputs = tokenizer(
-            prefixed,
-            return_tensors="pt",
-            max_length=512,
-            truncation=True,
-            padding=True,          # ← padding để stack thành batch
-        ).to(device)
+            inputs = tokenizer(
+                prefixed, return_tensors="pt",
+                max_length=512, truncation=True, padding=True,
+            ).to(device)
 
-        # Tính num_beams cho cả batch (lấy max để đảm bảo chất lượng)
-        # Hoặc dùng greedy (num_beams=1) để tối đa tốc độ
-        max_len = max(len(t) for t in batch_texts)
-        num_beams = get_num_beams_batch(max_len)
+            with torch.no_grad():
+                outputs = nlp_model.generate(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_length=512,
+                    num_beams=num_beams,
+                    no_repeat_ngram_size=3 if num_beams > 1 else 0,
+                    early_stopping=(num_beams > 1),
+                )
 
-        with torch.no_grad():
-            outputs = nlp_model.generate(
-                inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_length=512,
-                num_beams=num_beams,
-                no_repeat_ngram_size=3 if num_beams > 1 else 0,
-                early_stopping=(num_beams > 1),
-            )
-
-        # Decode từng output trong batch
-        for local_idx, (out, raw) in enumerate(zip(outputs, batch_texts)):
-            corrected = tokenizer.decode(out, skip_special_tokens=True).strip()
-            if is_hallucinated(corrected):
-                corrected = raw
-            global_idx = non_empty_indices[batch_start + local_idx]
-            results[global_idx] = corrected
+            for j, (orig_idx, raw) in enumerate(batch_items):
+                corrected = tokenizer.decode(outputs[j], skip_special_tokens=True).strip()
+                results[orig_idx] = raw if is_hallucinated(corrected) else corrected
 
     return results
-
-# new
-def get_num_beams_batch(max_text_len: int) -> int:
-    """
-    Phiên bản cho batch: dùng max độ dài trong batch để quyết định beam.
-    Ưu tiên greedy/beam nhỏ để batch nhanh hơn.
-    """
-    if max_text_len <= 10:
-        return 1
-    elif max_text_len <= 30:
-        return 2
-    elif max_text_len <= 80:
-        return 3
-    else:
-        return 5
 
 def fuzzy_match_dict(text, dictionary, threshold=0.85):
     """So khớp mờ text với dictionary.
